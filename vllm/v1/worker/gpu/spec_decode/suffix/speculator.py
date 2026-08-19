@@ -89,6 +89,16 @@ class SuffixSpeculator(BaseSpeculator):
             dtype=torch.int32,
             pin_memory=device.type == "cuda",
         )
+        # Exact committed lengths (one step stale). Global-index
+        # ingestion must not use the optimistic num_computed mirror: it
+        # runs ahead of verification by up to a full speculation window,
+        # where the token buffer holds no committed data, so the
+        # append-only index would absorb garbage.
+        self._total_len_cpu = torch.zeros(
+            self.max_num_reqs,
+            dtype=torch.int32,
+            pin_memory=device.type == "cuda",
+        )
         self._num_valid_gpu: torch.Tensor | None = None
         self._copy_stream: torch.cuda.Stream | None = None
         self._copy_event: torch.cuda.Event | None = None
@@ -232,7 +242,7 @@ class SuffixSpeculator(BaseSpeculator):
             draft_full, num_valid_full = self.drafter.propose(
                 total_len, token_ids, mask
             )
-        self._copy_num_valid(num_valid_full)
+        self._copy_step_state(num_valid_full)
 
         draft = draft_full[input_batch.idx_mapping].to(torch.int64)
         # Invalid slots are -1-padded by the drafter. Clamp them to a
@@ -241,20 +251,26 @@ class SuffixSpeculator(BaseSpeculator):
         # rejection sampling, so correctness is unaffected.
         return draft.clamp_(min=0)
 
-    def _copy_num_valid(self, num_valid_full: torch.Tensor) -> None:
-        """Start the D2H copy of this step's per-slot valid counts.
+    def _copy_step_state(self, num_valid_full: torch.Tensor) -> None:
+        """Start the D2H copy of this step's per-slot valid counts and
+        committed lengths.
 
-        The runner consumes them one step later, when these drafts are
-        verified, so a single buffer suffices: take_invalid_spec_tokens
-        always runs before the next propose overwrites it.
+        Consumers read them one step later (take_invalid_spec_tokens
+        when the drafts are verified, ingest lengths at the next
+        propose), so a single buffer suffices: both reads happen before
+        the next propose overwrites it.
         """
+        assert self.req_states is not None
+        total_len = self.req_states.total_len.gpu
         if self._copy_stream is None:
             self._num_valid_cpu.copy_(num_valid_full)
+            self._total_len_cpu.copy_(total_len)
             return
         assert self._copy_event is not None
         self._copy_stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(self._copy_stream):
             self._num_valid_cpu.copy_(num_valid_full, non_blocking=True)
+            self._total_len_cpu.copy_(total_len, non_blocking=True)
             self._copy_event.record()
         # Keep the producer tensor alive until the next step so the
         # allocator cannot hand its memory to later default-stream work
@@ -325,15 +341,21 @@ class SuffixSpeculator(BaseSpeculator):
             self._ingest_pending = False
 
     def _response_span(self, req_idx: int) -> tuple[int, int]:
-        """(start, length) of a slot's response tokens, best effort.
+        """(start, length) of a slot's committed response tokens.
 
-        num_computed_tokens_np is an optimistic upper bound under async
-        scheduling, so up to k not-yet-verified tokens may be included;
-        the V1 proposer ingested with the same optimism.
+        Lengths come from the previous step's total_len copy (exact but
+        one step stale); the optimistic num_computed mirror only bounds
+        freshly reused slots, whose copy still holds the prior
+        occupant's length for one step. Callers must synchronize
+        _copy_event first.
         """
         assert self.req_states is not None
         start = int(self.req_states.prompt_len.np[req_idx])
-        resp_len = int(self.req_states.num_computed_tokens_np[req_idx]) + 1 - start
+        resp_len = min(
+            int(self._total_len_cpu[req_idx]),
+            int(self.req_states.num_computed_tokens_np[req_idx]) + 1,
+        )
+        resp_len -= start
         return start, max(0, min(resp_len, self.max_model_len - start))
 
     def _ingest_active(self, input_batch: InputBatch) -> None:
@@ -341,6 +363,8 @@ class SuffixSpeculator(BaseSpeculator):
         if self.drafter.global_index is None:
             return
         assert self.req_states is not None
+        if self._copy_event is not None:
+            self._copy_event.synchronize()
         token_ids = self.req_states.all_token_ids.gpu
         keys: list[str] = []
         rows: list[torch.Tensor] = []
@@ -360,6 +384,8 @@ class SuffixSpeculator(BaseSpeculator):
         """Final-flush finished requests before their slots are reused."""
         if self.drafter.global_index is None or self.req_states is None:
             return
+        if self._copy_event is not None:
+            self._copy_event.synchronize()
         token_ids = self.req_states.all_token_ids.gpu
         keys: list[str] = []
         rows: list[torch.Tensor] = []
