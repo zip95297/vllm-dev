@@ -142,6 +142,7 @@ from vllm.v1.worker.gpu.spec_decode.rejection_sampler import (
     get_max_chunk_logits,
 )
 from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
+from vllm.v1.worker.gpu.spec_decode.suffix.speculator import SuffixSpeculator
 from vllm.v1.worker.gpu.spec_decode.utils import DraftTokensHandler
 from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.gpu.structured_outputs import StructuredOutputsWorker
@@ -287,6 +288,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             device=self.device,
             num_prefill_lookahead=num_prefill_lookahead,
         )
+        if isinstance(self.speculator, SuffixSpeculator):
+            # The suffix drafter reads token history and lengths directly
+            # from the runner-maintained request states.
+            self.speculator.set_request_states(self.req_states)
         self.adaptive_verification: AdaptiveVerificationManager | None = None
         self.input_buffers = InputBuffers(
             max_num_reqs=self.max_num_reqs,
@@ -932,6 +937,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
     def finish_requests(self, scheduler_output: SchedulerOutput) -> None:
         finished_req_ids = scheduler_output.finished_req_ids
+        if isinstance(self.speculator, SuffixSpeculator):
+            # Flush finished responses into the drafter's global index
+            # before their slots are freed and rewritten. Preempted
+            # requests are skipped: they resume with the same tokens.
+            self.speculator.on_requests_finished(finished_req_ids)
         if self.pooling_runner is not None:
             # Preempted docs keep their query-use reservation until rescheduled.
             self.pooling_runner.on_requests_finished(finished_req_ids)

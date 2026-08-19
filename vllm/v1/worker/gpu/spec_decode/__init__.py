@@ -42,5 +42,11 @@ def init_speculator(vllm_config: VllmConfig, device: torch.device):
         )
 
         return EagleSpeculator(vllm_config, device)
+    elif speculative_config.use_suffix_gpu():
+        from vllm.v1.worker.gpu.spec_decode.suffix.speculator import (
+            SuffixSpeculator,
+        )
+
+        return SuffixSpeculator(vllm_config, device)
     else:
         raise NotImplementedError(f"{speculative_config.method} is not supported yet.")
