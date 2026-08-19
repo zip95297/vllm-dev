@@ -94,9 +94,12 @@ def test_ngram_gpu_default_with_async_scheduling(
 
 
 @pytest.mark.parametrize("async_scheduling", [True], ids=["async"])
+@pytest.mark.parametrize("use_v2_model_runner", ["0", "1"], ids=["mrv1", "mrv2"])
 @single_gpu_only
 def test_suffix_gpu_with_async_scheduling(
     async_scheduling: bool,
+    use_v2_model_runner: str,
+    monkeypatch: pytest.MonkeyPatch,
     model_name: str,
     vllm_runner,
 ):
@@ -104,9 +107,11 @@ def test_suffix_gpu_with_async_scheduling(
     Test suffix_gpu speculative decoding (k=16) correctness under async
     scheduling, validated via GSM8K accuracy. The CPU suffix method is
     rejected by the async-scheduling whitelist; suffix_gpu is the
-    device-state variant that composes with it.
+    device-state variant that composes with it. Covers both model
+    runners: V1 uses SuffixProposerGPU, V2 uses SuffixSpeculator.
     """
     pytest.importorskip("suffix_gpu")
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", use_v2_model_runner)
     with vllm_runner(
         model_name,
         block_size=None,
