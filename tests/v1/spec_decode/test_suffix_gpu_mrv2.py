@@ -200,3 +200,24 @@ def test_ingest_and_cross_request_draft():
     assert n > 0
     assert draft[0, :n].tolist() == expect[:n]
 
+
+def test_take_invalid_spec_tokens_reports_padding():
+    speculator = _make_speculator(False)
+    req_idx = _add_request(speculator, "req-0", HIST)
+    _propose(speculator, ["req-0"])
+
+    _, num_valid = _raw_reference(HIST)
+    input_batch = SimpleNamespace(
+        req_ids=["req-0"],
+        idx_mapping_np=[req_idx],
+        num_draft_tokens_per_req=[K],
+    )
+    counts = speculator.take_invalid_spec_tokens(input_batch)
+    if num_valid == K:
+        assert counts is None
+    else:
+        assert counts == {"req-0": K - num_valid}
+
+    # No drafts scheduled (e.g. pure prefill step): nothing to report.
+    input_batch = SimpleNamespace(num_draft_tokens_per_req=None)
+    assert speculator.take_invalid_spec_tokens(input_batch) is None

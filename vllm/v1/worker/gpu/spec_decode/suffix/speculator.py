@@ -79,6 +79,23 @@ class SuffixSpeculator(BaseSpeculator):
         self._graph_outputs: tuple[torch.Tensor, torch.Tensor] | None = None
         self._graph_failed = False
 
+        # Per-slot valid-draft counts, copied D2H on a side stream each
+        # step. The runner reports the padded remainder of the previous
+        # step's drafts as num_invalid_spec_tokens so metrics do not
+        # count padding as real drafts (the V1 runner reports the same
+        # via copy_num_valid_draft_tokens).
+        self._num_valid_cpu = torch.zeros(
+            self.max_num_reqs,
+            dtype=torch.int32,
+            pin_memory=device.type == "cuda",
+        )
+        self._num_valid_gpu: torch.Tensor | None = None
+        self._copy_stream: torch.cuda.Stream | None = None
+        self._copy_event: torch.cuda.Event | None = None
+        if device.type == "cuda":
+            self._copy_stream = torch.cuda.Stream(device)
+            self._copy_event = torch.cuda.Event()
+
         # Global-index ingestion runs on a side stream so its delta
         # copies stay off the step critical path; sync_pending_ingest()
         # orders later default-stream work after the pending reads.
@@ -210,9 +227,12 @@ class SuffixSpeculator(BaseSpeculator):
         if self._graph is not None:
             assert self._graph_outputs is not None
             self._graph.replay()
-            draft_full, _ = self._graph_outputs
+            draft_full, num_valid_full = self._graph_outputs
         else:
-            draft_full, _ = self.drafter.propose(total_len, token_ids, mask)
+            draft_full, num_valid_full = self.drafter.propose(
+                total_len, token_ids, mask
+            )
+        self._copy_num_valid(num_valid_full)
 
         draft = draft_full[input_batch.idx_mapping].to(torch.int64)
         # Invalid slots are -1-padded by the drafter. Clamp them to a
@@ -220,6 +240,52 @@ class SuffixSpeculator(BaseSpeculator):
         # TP=1, and a clamped pad is still verified token-by-token by
         # rejection sampling, so correctness is unaffected.
         return draft.clamp_(min=0)
+
+    def _copy_num_valid(self, num_valid_full: torch.Tensor) -> None:
+        """Start the D2H copy of this step's per-slot valid counts.
+
+        The runner consumes them one step later, when these drafts are
+        verified, so a single buffer suffices: take_invalid_spec_tokens
+        always runs before the next propose overwrites it.
+        """
+        if self._copy_stream is None:
+            self._num_valid_cpu.copy_(num_valid_full)
+            return
+        assert self._copy_event is not None
+        self._copy_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(self._copy_stream):
+            self._num_valid_cpu.copy_(num_valid_full, non_blocking=True)
+            self._copy_event.record()
+        # Keep the producer tensor alive until the next step so the
+        # allocator cannot hand its memory to later default-stream work
+        # while the side-stream copy is still reading it.
+        self._num_valid_gpu = num_valid_full
+
+    def take_invalid_spec_tokens(
+        self, input_batch: InputBatch
+    ) -> dict[str, int] | None:
+        """Padded (never-valid) slots among this step's scheduled drafts.
+
+        Under async scheduling every running request gets k placeholder
+        slots regardless of the drafter's actual emission; report the
+        remainder so spec-decode metrics count only real drafts.
+        """
+        num_draft_tokens_per_req = input_batch.num_draft_tokens_per_req
+        if num_draft_tokens_per_req is None:
+            return None
+        if self._copy_event is not None:
+            self._copy_event.synchronize()
+        num_valid = self._num_valid_cpu.numpy()
+        counts: dict[str, int] = {}
+        for i, req_id in enumerate(input_batch.req_ids):
+            num_draft_tokens = int(num_draft_tokens_per_req[i])
+            if num_draft_tokens <= 0:
+                continue
+            req_idx = int(input_batch.idx_mapping_np[i])
+            invalid = num_draft_tokens - int(num_valid[req_idx])
+            if invalid > 0:
+                counts[req_id] = invalid
+        return counts or None
 
     # ------------------------------------------------------------------
     # global-memory ingestion (host-side, off the draft path)

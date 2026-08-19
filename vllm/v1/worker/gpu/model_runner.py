@@ -1790,6 +1790,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             sampled_token_ids=None,  # type: ignore
             prompt_logprobs_dict=prompt_logprobs_dict,  # type: ignore[arg-type]
         )
+        if isinstance(self.speculator, SuffixSpeculator):
+            # Must run before this step's propose() overwrites the
+            # drafter's num_valid buffer.
+            model_runner_output.num_invalid_spec_tokens = (
+                self.speculator.take_invalid_spec_tokens(input_batch)
+            )
         # Start async output copy here so that it can overlap with speculator proposal.
         async_output = AsyncOutput(
             model_runner_output=model_runner_output,

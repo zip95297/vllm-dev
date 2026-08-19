@@ -135,8 +135,10 @@ def test_suffix_gpu_with_async_scheduling(
         evaluate_llm_for_gsm8k(spec_runner.llm)
 
 
+@pytest.mark.parametrize("use_v2_model_runner", ["0", "1"], ids=["mrv1", "mrv2"])
 @single_gpu_only
 def test_suffix_gpu_acceptance(
+    use_v2_model_runner: str,
     monkeypatch: pytest.MonkeyPatch,
     sampling_config: SamplingParams,
     model_name: str,
@@ -144,12 +146,12 @@ def test_suffix_gpu_acceptance(
 ):
     """
     Same acceptance-improvement check as test_suffix_decoding_acceptance,
-    for suffix_gpu under async scheduling. Relies on worker-reported
-    invalid-slot counts so padded spec slots do not deflate the
-    draft-token denominator.
+    for suffix_gpu under async scheduling, on both model runners. Relies
+    on worker-reported invalid-slot counts so padded spec slots do not
+    deflate the draft-token denominator.
     """
     pytest.importorskip("suffix_gpu")
-    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", use_v2_model_runner)
     test_prompts = get_test_prompts(mm_enabled=False)
 
     with vllm_runner(
