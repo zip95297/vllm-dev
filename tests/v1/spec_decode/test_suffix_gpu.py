@@ -147,6 +147,20 @@ def test_capture_draft_graph_warms_up_without_graph():
     assert d[0, :n].tolist() == ([6, 7, 8, 5] * 3)[:n]
 
 
+def test_scan_bucket_policy():
+    config = _make_config(False)
+    config.model_config.max_model_len = 32768
+    proposer = SuffixProposerGPU(config, DEVICE)
+
+    assert proposer._scan_bucket_sizes(1) == [256, 1024, 4096, 16384, 32768]
+    assert proposer._scan_bucket_sizes(16) == [1024, 4096, 16384, 32768]
+    assert proposer._scan_bucket_sizes(64) == [32768]
+    proposer._scan_buckets = {1: proposer._scan_bucket_sizes(1)}
+    assert proposer._select_scan_bucket(1, 255) == 256
+    assert proposer._select_scan_bucket(1, 257) == 1024
+    assert proposer._select_scan_bucket(1, 32768) == 32768
+
+
 def test_ingest_and_cross_request_draft():
     proposer = SuffixProposerGPU(_make_config(False), DEVICE)
     token_ids = torch.zeros(

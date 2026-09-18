@@ -22,6 +22,7 @@ import torch
 from vllm.config import VllmConfig
 from vllm.distributed.parallel_state import get_tp_group
 from vllm.logger import init_logger
+from vllm.platforms import current_platform
 from vllm.v1.spec_decode.ngram_proposer_gpu import NgramProposerGPU
 from vllm.v1.worker.gpu_input_batch import InputBatch
 
@@ -75,13 +76,15 @@ class SuffixProposerGPU:
         # do not replay max-batch kernels; all buckets share the
         # max-batch staging buffers below.
         self._graphs: dict[
-            int, tuple[torch.cuda.CUDAGraph, torch.Tensor, torch.Tensor]
+            tuple[int, int],
+            tuple[torch.cuda.CUDAGraph, torch.Tensor, torch.Tensor],
         ] = {}
         self._graph_buckets: list[int] = []
+        self._scan_buckets: dict[int, list[int]] = {}
+        self._graph_pool: tuple[int, int] | None = None
         self._graph_failed = False
         self._g_num_tokens: torch.Tensor | None = None
-        self._g_sampled: torch.Tensor | None = None
-        self._g_counts: torch.Tensor | None = None
+        self._g_mask: torch.Tensor | None = None
         self._g_token_ids: torch.Tensor | None = None
 
         self._warmed_up = False
@@ -249,48 +252,67 @@ class SuffixProposerGPU:
         sizes.append(max_batch)
         return sizes
 
+    def _scan_bucket_sizes(self, batch_bucket: int) -> list[int]:
+        if batch_bucket <= 8:
+            candidates = (256, 1024, 4096, 16384)
+        elif batch_bucket <= 32:
+            candidates = (1024, 4096, 16384)
+        else:
+            candidates = ()
+        return sorted(
+            {
+                *(size for size in candidates if size < self.max_model_len),
+                self.max_model_len,
+            }
+        )
+
+    def _select_scan_bucket(self, batch_bucket: int, upper_bound: int) -> int:
+        buckets = self._scan_buckets[batch_bucket]
+        return next((size for size in buckets if size >= upper_bound), buckets[-1])
+
     def _capture_buckets(self, token_ids_gpu: torch.Tensor, sampled_width: int) -> None:
-        """Capture update+propose per batch bucket on shared buffers.
+        """Capture propose per batch/scan bucket on shared buffers.
 
         token_ids_gpu is the runner's persistent buffer, so the graphs
-        bind its storage directly; per-step inputs are staged into the
-        shared fixed buffers before replay.
+        bind its storage directly; a fused kernel updates state and stages
+        fixed graph inputs before replay.
         """
         b_max = self.max_num_seqs
         self._g_num_tokens = torch.zeros(b_max, dtype=torch.int32, device=self.device)
-        self._g_sampled = torch.full(
-            (b_max, sampled_width), -1, dtype=torch.int32, device=self.device
-        )
-        self._g_counts = torch.zeros(b_max, dtype=torch.int64, device=self.device)
+        self._g_mask = torch.zeros(b_max, dtype=torch.bool, device=self.device)
         self._g_token_ids = token_ids_gpu
         buckets = self._bucket_sizes(b_max)
+        graph_keys = [(b, scan) for b in buckets for scan in self._scan_bucket_sizes(b)]
+        self._scan_buckets = {b: self._scan_bucket_sizes(b) for b in buckets}
         # Eagerly warm every bucket shape first: Triton JIT inside a
         # capture would invalidate it.
-        for b in buckets:
-            self.drafter.propose_with_update(
+        for b, scan in graph_keys:
+            self.drafter.propose(
                 self._g_num_tokens[:b],
                 self._g_token_ids[:b],
-                self._g_sampled[:b],
-                self._g_counts[:b],
-                max_model_len=self.max_model_len,
+                self._g_mask[:b],
+                scan_limit=scan,
             )
         torch.accelerator.synchronize(self.device)
-        for b in buckets:
+        self._graph_pool = current_platform.graph_pool_handle()
+        for b, scan in sorted(
+            graph_keys, key=lambda key: key[0] * key[1], reverse=True
+        ):
             graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
-                draft, nv, _ = self.drafter.propose_with_update(
+            with torch.cuda.graph(graph, pool=self._graph_pool):
+                draft, nv = self.drafter.propose(
                     self._g_num_tokens[:b],
                     self._g_token_ids[:b],
-                    self._g_sampled[:b],
-                    self._g_counts[:b],
-                    max_model_len=self.max_model_len,
+                    self._g_mask[:b],
+                    scan_limit=scan,
                 )
-            self._graphs[b] = (graph, draft, nv)
+            self._graphs[(b, scan)] = (graph, draft, nv)
         self._graph_buckets = buckets
         logger.info_once(
             "suffix_gpu: draft path captured into CUDA "
-            "graphs (buckets=%s, sampled_width=%d)",
+            "graphs (batch_buckets=%s, scan_buckets=%s, sampled_width=%d)",
             str(buckets),
+            str(self._scan_buckets),
             sampled_width,
         )
 
@@ -301,6 +323,7 @@ class SuffixProposerGPU:
         token_ids_gpu: torch.Tensor,
         valid_sampled_token_ids_gpu: torch.Tensor,
         valid_sampled_tokens_count: torch.Tensor,
+        scan_limit_upper_bound: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Draft tokens for the batch; mirrors NgramProposerGPU.propose.
 
@@ -340,16 +363,25 @@ class SuffixProposerGPU:
         ):
             # Staging buffers are allocated together with the graphs.
             assert self._g_num_tokens is not None
-            assert self._g_sampled is not None
-            assert self._g_counts is not None
+            assert self._g_mask is not None
             b = next(s for s in self._graph_buckets if s >= bs)
-            graph, g_draft, g_nv = self._graphs[b]
-            self._g_num_tokens[:bs].copy_(num_tokens_no_spec)
-            self._g_num_tokens[bs:b].zero_()
-            self._g_sampled[:b].fill_(-1)
-            self._g_sampled[:bs, :width].copy_(valid_sampled_token_ids_gpu)
-            self._g_counts[:bs].copy_(valid_sampled_tokens_count)
-            self._g_counts[bs:b].zero_()
+            upper_bound = (
+                self.max_model_len
+                if scan_limit_upper_bound is None
+                else min(max(scan_limit_upper_bound, 1), self.max_model_len)
+            )
+            scan = self._select_scan_bucket(b, upper_bound)
+            graph, g_draft, g_nv = self._graphs[(b, scan)]
+            self.drafter.stage_graph_update(
+                num_tokens_no_spec,
+                self._g_token_ids[:b],
+                valid_sampled_token_ids_gpu,
+                valid_sampled_tokens_count,
+                self._g_num_tokens[:b],
+                self._g_mask[:b],
+                bs,
+                max_model_len=self.max_model_len,
+            )
             graph.replay()
             return g_draft[:bs], g_nv[:bs]
 

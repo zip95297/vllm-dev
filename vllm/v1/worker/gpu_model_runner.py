@@ -5115,13 +5115,27 @@ class GPUModelRunner(
 
             batch_size = next_token_ids.shape[0]
 
-            draft_token_ids, num_valid_draft_tokens = self.drafter.propose(
-                num_spec_tokens_to_schedule,
-                self.num_tokens_no_spec_gpu[:batch_size],
-                self.token_ids_gpu_tensor[:batch_size],
-                valid_sampled_token_ids_gpu,
-                valid_sampled_tokens_count,
-            )
+            if isinstance(self.drafter, SuffixProposerGPU) and batch_size > 0:
+                scan_limit_upper_bound = (
+                    int(self.input_batch.num_tokens_no_spec[:batch_size].max())
+                    + valid_sampled_token_ids_gpu.shape[1]
+                )
+                draft_token_ids, num_valid_draft_tokens = self.drafter.propose(
+                    num_spec_tokens_to_schedule,
+                    self.num_tokens_no_spec_gpu[:batch_size],
+                    self.token_ids_gpu_tensor[:batch_size],
+                    valid_sampled_token_ids_gpu,
+                    valid_sampled_tokens_count,
+                    scan_limit_upper_bound=scan_limit_upper_bound,
+                )
+            else:
+                draft_token_ids, num_valid_draft_tokens = self.drafter.propose(
+                    num_spec_tokens_to_schedule,
+                    self.num_tokens_no_spec_gpu[:batch_size],
+                    self.token_ids_gpu_tensor[:batch_size],
+                    valid_sampled_token_ids_gpu,
+                    valid_sampled_tokens_count,
+                )
 
             # Cache valid draft counts for scheduler-side trimming.
             self._num_valid_draft_tokens = num_valid_draft_tokens
